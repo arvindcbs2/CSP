@@ -1,0 +1,199 @@
+// Worker: safe nonce injector + inline-handler converter using HTMLRewriter
+
+
+function generateNonce() {
+  // generate 16-byte hex nonce
+  const array = new Uint8Array(16);
+  crypto.getRandomValues(array);
+  return Array.from(array, b => b.toString(16).padStart(2, "0")).join("");
+}
+
+
+// We will collect a small list of inline handlers to convert
+class ScriptInjector {
+  constructor(nonce) {
+    this.nonce = nonce;
+    this.injected = false;
+    this.collectedHandlers = []; // {selectorIndex, ev, code}
+    this.elementIndex = 0;
+  }
+
+
+  // Called for each <script> start tag
+  element(element) {
+    // add nonce attribute if not present
+    if (!element.getAttribute("nonce")) {
+      element.setAttribute("nonce", this.nonce);
+    }
+  }
+}
+
+
+class StyleInjector {
+  constructor(nonce) { this.nonce = nonce; }
+  element(element) {
+    if (!element.getAttribute("nonce")) {
+      element.setAttribute("nonce", this.nonce);
+    }
+  }
+}
+
+
+class InlineHandlerTransformer {
+  constructor() {
+    this.counter = 0;
+    this.handlers = []; // {id, event, code}
+  }
+
+
+  element(element) {
+    // iterate common inline event attributes
+    const events = [
+      "onclick","ondblclick","onchange","onsubmit","onload","onmouseover",
+      "onmouseout","onfocus","onblur","onkeyup","onkeydown","onkeypress"
+    ];
+
+
+    let added = false;
+    events.forEach(ev => {
+      const val = element.getAttribute(ev);
+      if (val !== null) {
+        // create a unique id for this element to find it later
+        let id = element.getAttribute("data-cfw-id");
+        if (!id) {
+          id = `cfw-${(++this.counter)}`;
+          element.setAttribute("data-cfw-id", id);
+        }
+        // store handler for later injection
+        this.handlers.push({ id, event: ev.slice(2), code: val });
+        // remove the inline attribute
+        element.removeAttribute(ev);
+        added = true;
+      }
+    });
+    // nothing to output here (attributes already updated by DOM)
+  }
+}
+
+
+export default {
+  async fetch(request, env, ctx) {
+    // Only handle GET/HEAD for HTML pages (avoid proxying /api etc.)
+    const nonce = generateNonce();
+
+
+    // Fetch origin response (preserve method, headers)
+    const originResp = await fetch(request);
+
+
+    // If not HTML, just pass through but add CSP header for other resources? We'll only modify HTML.
+    const contentType = originResp.headers.get("Content-Type") || "";
+    if (!contentType.toLowerCase().includes("text/html")) {
+      // For non-HTML responses, forward unchanged but make sure any CORS or other headers are preserved
+      // We'll not set CSP for non-html resources
+      return originResp;
+    }
+
+
+    // Prepare the rewriter transformers
+    const scriptTransformer = new ScriptInjector(nonce);
+    const styleTransformer = new StyleInjector(nonce);
+    const handlerTransformer = new InlineHandlerTransformer();
+
+
+    // Rewriter: add nonce to <script> and <style>, and remove inline event handlers (collect them)
+    const rewriter = new HTMLRewriter()
+      .on("script", scriptTransformer)
+      .on("style", styleTransformer)
+      // transform all elements to look for inline handlers
+      .on("*", handlerTransformer);
+
+
+    // Apply rewriter to origin response
+    const transformedResp = rewriter.transform(originResp);
+    let html = await transformedResp.text();
+
+
+    // Build CSP header (single-line). Include any external hosts you need.
+    // IMPORTANT: do not include line breaks. Keep it one header string.
+    const csp =
+      "default-src 'self'; " +
+      "script-src 'self' 'nonce-" + nonce + "' " +
+      "123.201.158.21 203.123.40.23 adobe.com aryaoffshore.com bit.ly " +
+      "documentcloud.adobe.com email.aryaoffshore.com facebook.com " +
+      "fonts.googleapis.com google.com googleapis.com googletagmanager.com " +
+      "gstatic.com hrms.jmbaxi.com ict.in imageonline.co.in instagram.com " +
+      "jmbaxi.com jmbaxico.com linkedin.com portal.portall.in " +
+      "projectabc1.aryaoffshore.com www.facebook.com www.google.com " +
+      "www.googletagmanager.com www.ict.in www.imageonline.co.in " +
+      "www.instagram.com www.jmbaxi.com www.jmbaxico.com www.linkedin.com " +
+      "x.com www.google-analytics.com; " +
+      "style-src 'self' 'unsafe-inline' fonts.googleapis.com imageonline.co.in; " +
+      "font-src 'self' fonts.gstatic.com; " +
+      "img-src 'self' jmbaxi.com jmbaxico.com imageonline.co.in google.com " +
+      "googleapis.com gstatic.com facebook.com instagram.com linkedin.com " +
+      "www.google.com www.google-analytics.com; " +
+      "frame-src 'self' documentcloud.adobe.com www.youtube.com youtube.com " +
+      "youtube-nocookie.com bit.ly esg.churchgatepartners.com; " +
+      "connect-src 'self' www.google-analytics.com googletagmanager.com; " +
+      "media-src 'self'; " +
+      "object-src 'none'; base-uri 'self'; form-action 'self'; " +
+      "frame-ancestors 'none'; upgrade-insecure-requests; " +
+      "report-uri https://www.jmbaxi.com/csp-report;";
+
+
+
+
+    // If we found inline handlers, inject a small script at the end of <body> that attaches them.
+    // Build the handler attachment script. It will run with the same nonce.
+    let attachScript = "";
+    if (handlerTransformer.handlers.length > 0) {
+      const handlersArray = JSON.stringify(handlerTransformer.handlers);
+      attachScript = `
+<script nonce="${nonce}">
+(function(){
+  try {
+    const items = ${handlersArray};
+    items.forEach(function(it){
+      var el = document.querySelector('[data-cfw-id="'+it.id+'"]');
+      if (!el) return;
+      try {
+        // create a function from the handler code. 'this' inside will be element
+        var fn = new Function(it.code);
+        el.addEventListener(it.event, function(e){
+          // provide same semantics: 'this' and event object are available
+          return fn.call(this, e);
+        }, false);
+      } catch(err) {
+        // silently ignore
+        console.error('CFW handler error', err);
+      }
+    });
+  } catch(ex) {
+    console.error('CFW attach handlers error', ex);
+  }
+})();
+</script>
+`;
+      // append just before </body>
+      if (html.lastIndexOf("</body>") !== -1) {
+        html = html.replace("</body>", attachScript + "</body>");
+      } else {
+        html += attachScript;
+      }
+    }
+
+
+    // Build new headers (clone origin headers to preserve cookies, etc.)
+    const newHeaders = new Headers(originResp.headers);
+    newHeaders.set("Content-Security-Policy", csp);
+    // Optionally add an X header for debugging
+    newHeaders.set("x-cfw-nonce", nonce);
+
+
+    return new Response(html, {
+      status: originResp.status,
+      headers: newHeaders
+    });
+  }
+}
